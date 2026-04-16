@@ -112,6 +112,7 @@ int index_status(const Index *index) {
 int index_load(Index *index) {
     FILE *f = fopen(".pes/index", "r");
 
+    // If file doesn't exist → empty index
     if (!f) {
         index->count = 0;
         return 0;
@@ -119,10 +120,12 @@ int index_load(Index *index) {
 
     index->count = 0;
 
-    while (!feof(f)) {
+    char line[1024];
+
+    while (fgets(line, sizeof(line), f)) {
         IndexEntry entry;
 
-        if (fscanf(f, "%o %s %ld %ld %s\n",
+        if (sscanf(line, "%o %64s %ld %ld %255[^\n]",
                    &entry.mode,
                    entry.hash,
                    &entry.mtime_sec,
