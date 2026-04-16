@@ -1,56 +1,128 @@
-// index.h — Staging area (index) interface
-//
-// The index is a text file (.pes/index) that tracks which files are
-// staged for the next commit. It maps file paths to their blob hashes
-// and stores metadata for fast change detection.
-
-#ifndef INDEX_H
-#define INDEX_H
-
+#include "index.h"
 #include "pes.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
 
-#define MAX_INDEX_ENTRIES 10000
+#define INDEX_FILE ".pes/index"
 
-typedef struct {
-    uint32_t mode;          // File mode (100644, 100755, etc.)
-    ObjectID hash;          // SHA-256 of the staged blob
-    uint64_t mtime_sec;     // Last modification time (seconds since epoch)
-    uint32_t size;          // File size in bytes at time of staging
-    char path[512];         // Relative path from repo root (e.g., "src/main.c")
-} IndexEntry;
+int index_load(Index *idx) {
 
-typedef struct {
-    IndexEntry entries[MAX_INDEX_ENTRIES];
-    int count;
-} Index;
+    idx->count = 0;
 
-// Load the index from .pes/index into memory.
-// If the file does not exist (no files staged yet), initializes an empty index.
-int index_load(Index *index);
+    FILE *f = fopen(INDEX_FILE, "r");
+    if (!f) return 0;
 
-// Save the index to .pes/index using atomic write (temp file + rename).
-int index_save(const Index *index);
+    char path[256], hash_hex[HASH_HEX_SIZE + 1];
+    int mode;
 
-// Stage a file: read its contents, write as a blob, update/add index entry.
-int index_add(Index *index, const char *path);
+    while (fscanf(f, "%o %s %s\n", &mode, hash_hex, path) == 3) {
 
-// Remove a file from the index (unstage it).
-int index_remove(Index *index, const char *path);
+        idx->entries[idx->count].mode = mode;
+        strcpy(idx->entries[idx->count].path, path);
+        hex_to_hash(hash_hex, &idx->entries[idx->count].hash);
 
-// Find an entry by path. Returns pointer to the entry, or NULL if not found.
-IndexEntry* index_find(Index *index, const char *path);
+        idx->count++;
+    }
 
-// Print the status of the working directory compared to the index and HEAD.
-// Output format:
-//   Staged changes:
-//     staged:     <path>
-//
-//   Unstaged changes:
-//     modified:   <path>
-//     deleted:    <path>
-//
-//   Untracked files:
-//     untracked:  <path>
-int index_status(const Index *index);
+    fclose(f);
+    return 0;
+}
 
-#endif // INDEX_H
+int index_save(const Index *idx) {
+
+    mkdir(".pes", 0755);
+
+    FILE *f = fopen(INDEX_FILE, "w");
+    if (!f) return -1;
+
+    for (int i = 0; i < idx->count; i++) {
+
+        char hex[HASH_HEX_SIZE + 1];
+        hash_to_hex(&idx->entries[i].hash, hex);
+
+        fprintf(f, "%o %s %s\n",
+                idx->entries[i].mode,
+                hex,
+                idx->entries[i].path);
+    }
+
+    fclose(f);
+    return 0;
+}
+
+int index_add(Index *idx, const char *path) {
+
+    index_load(idx);
+
+    mkdir(".pes", 0755);
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    fseek(f, 0, SEEK_END);
+    size_t size = ftell(f);
+    rewind(f);
+
+    void *data = malloc(size);
+    fread(data, 1, size, f);
+    fclose(f);
+
+    ObjectID id;
+    object_write(OBJ_BLOB, data, size, &id);
+    free(data);
+
+    for (int i = 0; i < idx->count; i++) {
+        if (strcmp(idx->entries[i].path, path) == 0) {
+            idx->entries[i].hash = id;
+            index_save(idx);
+            return 0;
+        }
+    }
+
+    strcpy(idx->entries[idx->count].path, path);
+    idx->entries[idx->count].hash = id;
+    idx->entries[idx->count].mode = 0100644;
+
+    idx->count++;
+
+    index_save(idx);
+
+    return 0;
+}
+
+int index_status(const Index *idx) {
+
+    (void)idx;  // not used
+
+    FILE *f = fopen(".pes/index", "r");
+    if (!f) {
+        printf("Index contains 0 entries:\n");
+        return 0;
+    }
+
+    int count = 0;
+    char line[512];
+
+    // First pass: count entries
+    while (fgets(line, sizeof(line), f)) {
+        count++;
+    }
+
+    rewind(f);
+
+    printf("Index contains %d entries:\n", count);
+
+    // Second pass: print paths
+    while (fgets(line, sizeof(line), f)) {
+        char mode[10], hash[70], path[256];
+
+        if (sscanf(line, "%s %s %s", mode, hash, path) == 3) {
+            printf("%s %s\n", mode, path);
+        }
+    }
+
+    fclose(f);
+    return 0;
+}
