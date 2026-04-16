@@ -1,243 +1,124 @@
-//Phase 4: Implement commit structure
-//Phase 4: Add tree integration
-//Phase 4: Add metadata and timestamp
-//Phase 4: Store commit object
-//Phase 4: Final commit implementation
-
-#include "commit.h"
-#include "index.h"
 #include "tree.h"
+#include "index.h"
 #include "pes.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <inttypes.h>
-#include <time.h>
-#include <unistd.h>
-#include <fcntl.h>
 
-// Forward declarations (from object.c)
-int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
-int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out);
+static int compare_entries(const void *a, const void *b) {
+    const TreeEntry *e1 = (const TreeEntry *)a;
+    const TreeEntry *e2 = (const TreeEntry *)b;
+    return strcmp(e1->name, e2->name);
+}
 
-// ─── PROVIDED FUNCTIONS (UNCHANGED) ───────────────────────────────────────────
+int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
 
-int commit_parse(const void *data, size_t len, Commit *commit_out) {
-    (void)len;
-    const char *p = (const char *)data;
-    char hex[HASH_HEX_SIZE + 1];
+    Tree sorted = *tree;
+    qsort(sorted.entries, sorted.count, sizeof(TreeEntry), compare_entries);
 
-    if (sscanf(p, "tree %64s\n", hex) != 1) return -1;
-    if (hex_to_hash(hex, &commit_out->tree) != 0) return -1;
-    p = strchr(p, '\n') + 1;
+    size_t size = 0;
 
-    if (strncmp(p, "parent ", 7) == 0) {
-        if (sscanf(p, "parent %64s\n", hex) != 1) return -1;
-        if (hex_to_hash(hex, &commit_out->parent) != 0) return -1;
-        commit_out->has_parent = 1;
-        p = strchr(p, '\n') + 1;
-    } else {
-        commit_out->has_parent = 0;
+    for (int i = 0; i < sorted.count; i++) {
+        size += strlen(sorted.entries[i].name) + HASH_SIZE + 16;
     }
 
-    char author_buf[256];
-    uint64_t ts;
+    char *buffer = malloc(size);
+    size_t offset = 0;
 
-    if (sscanf(p, "author %255[^\n]\n", author_buf) != 1) return -1;
+    for (int i = 0; i < sorted.count; i++) {
 
-    char *last_space = strrchr(author_buf, ' ');
-    if (!last_space) return -1;
+        TreeEntry *e = &sorted.entries[i];
 
-    ts = (uint64_t)strtoull(last_space + 1, NULL, 10);
-    *last_space = '\0';
+        int written = sprintf(buffer + offset, "%o %s", e->mode, e->name);
+        offset += written + 1;
 
-    snprintf(commit_out->author, sizeof(commit_out->author), "%s", author_buf);
-    commit_out->timestamp = ts;
+        memcpy(buffer + offset, e->hash.hash, HASH_SIZE);
+        offset += HASH_SIZE;
+    }
 
-    p = strchr(p, '\n') + 1;
-    p = strchr(p, '\n') + 1;
-    p = strchr(p, '\n') + 1;
-
-    snprintf(commit_out->message, sizeof(commit_out->message), "%s", p);
+    *data_out = buffer;
+    *len_out = offset;
 
     return 0;
 }
 
-int commit_serialize(const Commit *commit, void **data_out, size_t *len_out) {
+int tree_parse(const void *data, size_t len, Tree *tree_out) {
 
-    char tree_hex[HASH_HEX_SIZE + 1];
-    char parent_hex[HASH_HEX_SIZE + 1];
+    tree_out->count = 0;
 
-    hash_to_hex(&commit->tree, tree_hex);
+    const char *ptr = data;
+    const char *end = ptr + len;
 
-    char buf[8192];
-    int n = 0;
+    while (ptr < end && tree_out->count < MAX_TREE_ENTRIES) {
 
-    n += snprintf(buf + n, sizeof(buf) - n, "tree %s\n", tree_hex);
+        TreeEntry *e = &tree_out->entries[tree_out->count];
 
-    if (commit->has_parent) {
-        hash_to_hex(&commit->parent, parent_hex);
-        n += snprintf(buf + n, sizeof(buf) - n, "parent %s\n", parent_hex);
-    }
+        sscanf(ptr, "%o", &e->mode);
 
-    n += snprintf(buf + n, sizeof(buf) - n,
-                  "author %s %" PRIu64 "\n"
-                  "committer %s %" PRIu64 "\n"
-                  "\n"
-                  "%s",
-                  commit->author, commit->timestamp,
-                  commit->author, commit->timestamp,
-                  commit->message);
+        char *space = strchr(ptr, ' ');
+        if (!space) return -1;
+        ptr = space + 1;
 
-    *data_out = malloc(n + 1);
-    if (!*data_out) return -1;
+        char *null = memchr(ptr, '\0', end - ptr);
+        if (!null) return -1;
 
-    memcpy(*data_out, buf, n + 1);
-    *len_out = (size_t)n;
+        size_t name_len = null - ptr;
 
-    return 0;
-}
+        size_t copy_len = name_len < sizeof(e->name) - 1 ? name_len : sizeof(e->name) - 1;
+        memcpy(e->name, ptr, copy_len);
+        e->name[copy_len] = '\0';
 
-int commit_walk(commit_walk_fn callback, void *ctx) {
-    ObjectID id;
-    if (head_read(&id) != 0) return -1;
+        ptr = null + 1;
 
-    while (1) {
-        ObjectType type;
-        void *raw;
-        size_t raw_len;
+        if (ptr + HASH_SIZE > end) return -1;
 
-        if (object_read(&id, &type, &raw, &raw_len) != 0) return -1;
+        memcpy(e->hash.hash, ptr, HASH_SIZE);
+        ptr += HASH_SIZE;
 
-        Commit c;
-        int rc = commit_parse(raw, raw_len, &c);
-        free(raw);
-
-        if (rc != 0) return -1;
-
-        callback(&id, &c, ctx);
-
-        if (!c.has_parent) break;
-        id = c.parent;
+        tree_out->count++;
     }
 
     return 0;
 }
 
-int head_read(ObjectID *id_out) {
-    FILE *f = fopen(HEAD_FILE, "r");
-    if (!f) return -1;
+int tree_from_index(ObjectID *id_out) {
 
-    char line[512];
+    Index idx;
+    index_load(&idx);
 
-    if (!fgets(line, sizeof(line), f)) {
-        fclose(f);
-        return -1;
+    if (idx.count == 0) return -1;
+
+    Tree tree;
+    tree.count = 0;
+
+    for (int i = 0; i < idx.count; i++) {
+
+        TreeEntry *e = &tree.entries[tree.count];
+
+        e->mode = idx.entries[i].mode;
+
+        const char *name = strrchr(idx.entries[i].path, '/');
+        if (name) name++;
+        else name = idx.entries[i].path;
+
+        strncpy(e->name, name, sizeof(e->name) - 1);
+        e->name[sizeof(e->name) - 1] = '\0';
+
+        e->hash = idx.entries[i].hash;
+
+        tree.count++;
     }
-
-    fclose(f);
-    line[strcspn(line, "\r\n")] = '\0';
-
-    char ref_path[512];
-
-    if (strncmp(line, "ref: ", 5) == 0) {
-        snprintf(ref_path, sizeof(ref_path), "%s/%s", PES_DIR, line + 5);
-
-        f = fopen(ref_path, "r");
-        if (!f) return -1;
-
-        if (!fgets(line, sizeof(line), f)) {
-            fclose(f);
-            return -1;
-        }
-
-        fclose(f);
-        line[strcspn(line, "\r\n")] = '\0';
-    }
-
-    return hex_to_hash(line, id_out);
-}
-
-int head_update(const ObjectID *new_commit) {
-
-    mkdir(PES_DIR, 0755);
-    mkdir(PES_DIR "/refs", 0755);
-    mkdir(PES_DIR "/refs/heads", 0755);
-
-    FILE *f = fopen(HEAD_FILE, "r");
-
-    char line[512];
-
-    if (!f) {
-        // initialize HEAD
-        f = fopen(HEAD_FILE, "w");
-        fprintf(f, "ref: refs/heads/main\n");
-        fclose(f);
-
-        snprintf(line, sizeof(line), "ref: refs/heads/main");
-    } else {
-        fgets(line, sizeof(line), f);
-        fclose(f);
-        line[strcspn(line, "\r\n")] = '\0';
-    }
-
-    char target_path[512];
-
-    if (strncmp(line, "ref: ", 5) == 0) {
-        snprintf(target_path, sizeof(target_path), "%s/%s", PES_DIR, line + 5);
-    } else {
-        snprintf(target_path, sizeof(target_path), "%s", HEAD_FILE);
-    }
-
-    FILE *out = fopen(target_path, "w");
-    if (!out) return -1;
-
-    char hex[HASH_HEX_SIZE + 1];
-    hash_to_hex(new_commit, hex);
-
-    fprintf(out, "%s\n", hex);
-    fclose(out);
-
-    return 0;
-}
-
-// ─── FINAL IMPLEMENTATION ────────────────────────────────────────────────────
-
-int commit_create(const char *message, ObjectID *commit_id_out) {
-
-    ObjectID tree_id;
-    if (tree_from_index(&tree_id) != 0) return -1;
-
-    Commit c;
-    memset(&c, 0, sizeof(c));
-
-    c.tree = tree_id;
-
-    if (head_read(&c.parent) == 0)
-        c.has_parent = 1;
-    else
-        c.has_parent = 0;
-
-    snprintf(c.author, sizeof(c.author), "%s", pes_author());
-    c.timestamp = (uint64_t)time(NULL);
-
-    snprintf(c.message, sizeof(c.message), "%s", message);
 
     void *data;
     size_t len;
 
-    if (commit_serialize(&c, &data, &len) != 0) return -1;
+    if (tree_serialize(&tree, &data, &len) != 0) return -1;
 
-    if (object_write(OBJ_COMMIT, data, len, commit_id_out) != 0) {
+    if (object_write(OBJ_TREE, data, len, id_out) != 0) {
         free(data);
         return -1;
     }
 
     free(data);
-
-    if (head_update(commit_id_out) != 0) return -1;
-
-    printf("Created commit successfully\n");
-
     return 0;
 }
