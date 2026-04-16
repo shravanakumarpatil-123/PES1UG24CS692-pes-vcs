@@ -105,15 +105,19 @@ if (mkdir(".pes/objects", 0755) != 0 && access(".pes/objects", F_OK) != 0) {
     return -1;
 }
 
-    char dir[512];
-    strncpy(dir, path, sizeof(dir));
-    dir[sizeof(dir) - 1] = '\0';
+char dir[512];
+strncpy(dir, path, sizeof(dir));
+dir[sizeof(dir) - 1] = '\0';
 
-    char *slash = strrchr(dir, '/');
-    if (slash) {
-        *slash = '\0';
-        mkdir(dir, 0755);
+char *slash = strrchr(dir, '/');
+if (slash) {
+    *slash = '\0';
+
+    if (mkdir(dir, 0755) != 0 && access(dir, F_OK) != 0) {
+        free(buffer);
+        return -1;
     }
+}
 
     char temp_path[512];
     if (snprintf(temp_path, sizeof(temp_path), "%s.tmp", path) >= (int)sizeof(temp_path)) {
